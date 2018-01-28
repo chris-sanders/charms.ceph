@@ -59,8 +59,32 @@ class CephTestCase(unittest.TestCase):
         _cmp.return_value = True
         utils.osdize('/dev/sdb', osd_format='xfs', osd_journal=None,
                      reformat_osd=True, bluestore=False)
-        _call.assert_called_with(['ceph-disk', 'prepare', '--fs-type', 'xfs',
-                                  '--zap-disk', '--filestore', '/dev/sdb'])
+        calls = [call('ceph-disk zap /dev/sdb', shell=True),
+                 call(['ceph-disk', 'prepare', '--fs-type', 'xfs',
+                       '--filestore', '/dev/sdb'])]
+        _call.asswert_has_calls(calls)
+
+    @patch.object(utils.hookenv, 'charm_dir')
+    @patch.object(utils, 'config')
+    @patch.object(utils.subprocess, 'check_call')
+    @patch.object(utils.os.path, 'exists')
+    @patch.object(utils, 'is_device_mounted')
+    @patch.object(utils, 'cmp_pkgrevno')
+    @patch.object(utils, 'is_block_device')
+    def test_osdize_part(self, _is_blk, _cmp, _mounted,
+                         _exists, _call, _config, _charm_dir):
+        """Test that the shared osd is initialized correctly"""
+        _is_blk.return_value = True
+        _mounted.return_value = True
+        _exists.return_value = True
+        _cmp.return_value = True
+        _config.return_value = True
+        _charm_dir.return_value = ''
+        utils.osdize('/dev/sdb', osd_format='xfs', osd_journal=None,
+                     reformat_osd=True, bluestore=False)
+        _call.assert_called_with(['/files/ceph/setup_osd.py', 'prepare',
+                                  '--fs-type', 'xfs', '--filestore',
+                                  '/dev/sdb'])
 
     @patch.object(utils.subprocess, 'check_call')
     @patch.object(utils.os.path, 'exists')
@@ -80,6 +104,30 @@ class CephTestCase(unittest.TestCase):
                      bluestore=False)
         _call.assert_called_with(['sudo', '-u', 'ceph', 'ceph-disk', 'prepare',
                                   '--data-dir', '/srv/osd', '--filestore'])
+
+    @patch.object(utils, 'get_partition_list')
+    @patch.object(utils.subprocess, 'check_output')
+    def test_get_osd_partitions(self, output, partition_list):
+        """Returns a list of paritions if device is an osd"""
+        part1 = MagicMock()
+        partition_list.return_value = [part1]
+        output_template = """Partition GUID code: {}
+            Partition unique GUID: 6A009B71-D15E-4C8A-BE42-B729E30656DC
+            First sector: 195315712 (at 93.1 GiB)
+            Last sector: 195520511 (at 93.2 GiB)
+            Partition size: 204800 sectors (100.0 MiB)
+            Attribute flags: 0000000000000000
+            Partition name: 'part_template'"""
+
+        output.return_value = output_template.format(' ').encode('utf-8')
+        partitions = utils.get_osd_partitions('/dev/dummy')
+        self.assertFalse(partitions)
+
+        output.return_value = output_template.format(utils.CEPH_PARTITIONS[0])\
+                                             .encode('utf-8')
+        partitions = utils.get_osd_partitions('/dev/dummy')
+        self.assertTrue(partitions)
+        self.assertEqual(partitions[0], part1)
 
     @patch.object(utils.subprocess, 'check_output')
     def test_get_osd_weight(self, output):

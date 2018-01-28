@@ -814,12 +814,18 @@ DISK_FORMATS = [
 ]
 
 CEPH_PARTITIONS = [
-    '89C57F98-2FE5-4DC0-89C1-5EC00CEFF2BE',  # ceph encrypted disk in creation
-    '45B0969E-9B03-4F30-B4C6-5EC00CEFF106',  # ceph encrypted journal
-    '4FBD7E29-9D25-41B8-AFD0-5EC00CEFF05D',  # ceph encrypted osd data
-    '4FBD7E29-9D25-41B8-AFD0-062C0CEFF05D',  # ceph osd data
-    '45B0969E-9B03-4F30-B4C6-B4B80CEFF106',  # ceph osd journal
-    '89C57F98-2FE5-4DC0-89C1-F3AD0CEFF2BE',  # ceph disk in creation
+    '45B0969E-9B03-4F30-B4C6-B4B80CEFF106',  # journal
+    'CAFECAFE-9B03-4F30-B4C6-B4B80CEFF106',  # block
+    '4FBD7E29-9D25-41B8-AFD0-062C0CEFF05D',  # osd (data)
+    '89C57F98-2FE5-4DC0-89C1-F3AD0CEFF2BE',  # osd (data) in creation
+    'FB3AABF9-D25F-47CC-BF5E-721D1816496B',  # lockbox
+    '45b0969e-9b03-4f30-b4c6-35865ceff106',  # encrypted luks journal
+    'CAFECAFE-9B03-4F30-B4C6-35865CEFF106',  # encrypted luks block
+    '4FBD7E29-9D25-41B8-AFD0-35865CEFF05D',  # encrypted luks osd (data)
+    '45B0969E-9B03-4F30-B4C6-5EC00CEFF106',  # encrypted plain journal
+    'CAFECAFE-9B03-4F30-B4C6-5EC00CEFF106',  # encrypted plain block
+    '4FBD7E29-9D25-41B8-AFD0-5EC00CEFF05D',  # encrypted plain osd data
+    '89C57F98-2FE5-4DC0-89C1-5EC00CEFF2BE',  # encrypted osd (data) in creation
 ]
 
 
@@ -990,6 +996,28 @@ def is_osd_disk(dev):
     return False
 
 
+def get_osd_partitions(dev):
+    partitions = get_partition_list(dev)
+    osd_partitions = []
+    for partition in partitions:
+        try:
+            info = str(subprocess
+                       .check_output(['sgdisk', '-i', partition.number, dev])
+                       .decode('UTF-8'))
+            info = info.split("\n")  # IGNORE:E1103
+            for line in info:
+                for ptype in CEPH_PARTITIONS:
+                    sig = 'Partition GUID code: {}'.format(ptype)
+                    if line.startswith(sig):
+                        osd_partitions.append(partition)
+                        continue
+        except subprocess.CalledProcessError as e:
+            log("sgdisk inspection of partition {} on {} failed with "
+                "error: {}. Skipping".format(partition.minor, dev, e),
+                level=ERROR)
+    return osd_partitions
+
+
 def start_osds(devices):
     # Scan for ceph block devices
     rescan_osd_devices()
@@ -1063,6 +1091,7 @@ def generate_monitor_secret():
 
     return "{}==".format(res.split('=')[1].strip())
 
+
 # OSD caps taken from ceph-create-keys
 _osd_bootstrap_caps = {
     'mon': [
@@ -1123,6 +1152,7 @@ def import_radosgw_key(key):
             '--add-key={}'.format(key)
         ]
         subprocess.check_call(cmd)
+
 
 # OSD caps taken from ceph-create-keys
 _radosgw_caps = {
@@ -1428,36 +1458,8 @@ def get_devices(name):
     return set(devices)
 
 
-def osdize(dev, osd_format, osd_journal, reformat_osd=False,
-           ignore_errors=False, encrypt=False, bluestore=False):
-    if dev.startswith('/dev'):
-        osdize_dev(dev, osd_format, osd_journal,
-                   reformat_osd, ignore_errors, encrypt,
-                   bluestore)
-    else:
-        osdize_dir(dev, encrypt, bluestore)
-
-
-def osdize_dev(dev, osd_format, osd_journal, reformat_osd=False,
-               ignore_errors=False, encrypt=False, bluestore=False):
-    if not os.path.exists(dev):
-        log('Path {} does not exist - bailing'.format(dev))
-        return
-
-    if not is_block_device(dev):
-        log('Path {} is not a block device - bailing'.format(dev))
-        return
-
-    if is_osd_disk(dev) and not reformat_osd:
-        log('Looks like {} is already an'
-            ' OSD data or journal, skipping.'.format(dev))
-        return
-
-    if is_device_mounted(dev):
-        log('Looks like {} is in use, skipping.'.format(dev))
-        return
-
-    status_set('maintenance', 'Initializing device {}'.format(dev))
+def build_disk_cmd(osd_format=False, reformat_osd=False,
+                   encrypt=False, bluestore=False):
     cmd = ['ceph-disk', 'prepare']
     # Later versions of ceph support more options
     if cmp_pkgrevno('ceph', '0.60') >= 0:
@@ -1487,20 +1489,136 @@ def osdize_dev(dev, osd_format, osd_journal, reformat_osd=False,
         elif cmp_pkgrevno('ceph', '12.1.0') >= 0 and not bluestore:
             cmd.append('--filestore')
 
-        cmd.append(dev)
+    return cmd
 
-        if osd_journal:
-            least_used = find_least_used_utility_device(osd_journal)
-            cmd.append(least_used)
+
+def osdize(dev, osd_format, osd_journal, reformat_osd=False,
+           ignore_errors=False, encrypt=False, bluestore=False):
+    if dev.startswith('/dev'):
+        if is_device_mounted(dev) and config('osd-shared'):
+            osdize_part(dev, osd_format, osd_journal, ignore_errors,
+                        encrypt, bluestore, reformat_osd)
+        else:
+            osdize_dev(dev, osd_format, osd_journal,
+                       reformat_osd, ignore_errors, encrypt,
+                       bluestore)
     else:
-        # Just provide the device - no other options
-        # for older versions of ceph
-        cmd.append(dev)
-        if reformat_osd:
-            zap_disk(dev)
+        osdize_dir(dev, encrypt, bluestore)
+
+
+def osdize_dev(dev, osd_format, osd_journal, reformat_osd=False,
+               ignore_errors=False, encrypt=False, bluestore=False):
+    if not os.path.exists(dev):
+        log('Path {} does not exist - bailing'.format(dev))
+        return
+
+    if not is_block_device(dev):
+        log('Path {} is not a block device - bailing'.format(dev))
+        return
+
+    if is_osd_disk(dev) and not reformat_osd:
+        log('Looks like {} is already an'
+            ' OSD data or journal, skipping.'.format(dev))
+        return
+
+    if is_device_mounted(dev):
+        log('Looks like {} is in use, skipping.'.format(dev))
+        return
+
+    status_set('maintenance', 'Initializing device {}'.format(dev))
+    # Note(chrissanders): skip the --zap-disk command in ceph disk
+    # and run manual zap to support dmcrypt bluestore in 12.2.1
+    cmd = build_disk_cmd(osd_format=osd_format, reformat_osd=False,
+                         encrypt=encrypt, bluestore=bluestore)
+
+    if reformat_osd:
+        try:
+            log("zapping: {}".format(dev))
+            subprocess.check_call("ceph-disk zap {}".format(dev), shell=True)
+        except subprocess.CalledProcessError:
+            if ignore_errors:
+                log('Unable to zap device: {}'.format(dev), WARNING)
+            else:
+                log('Unable to zap device: {}'.format(dev), ERROR)
+                raise
+
+    cmd.append(dev)
+
+    if osd_journal:
+        least_used = find_least_used_utility_device(osd_journal)
+        cmd.append(least_used)
 
     try:
         log("osdize cmd: {}".format(cmd))
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        if ignore_errors:
+            log('Unable to initialize device: {}'.format(dev), WARNING)
+        else:
+            log('Unable to initialize device: {}'.format(dev), ERROR)
+            raise
+
+
+def osdize_part(dev, osd_format, osd_journal, ignore_errors=False,
+                encrypt=False, bluestore=False, reformat_osd=False):
+    """Setup partitions if missing and ask ceph-disk to prepare them.
+
+    :param dev: str. Path to a block device. ex: /dev/sda
+    :param osd_format: str. Filesystem to use on Filestore partitions.
+    :param osd_journal: str. Set of osd_journals to use instead of partition.
+    :param ignore_errors: bool. If true subprocess commands log error instead
+     of warning
+    :param encrypt: bool. Should the OSD partition be encrypted at rest
+    :param bluestore: bool. Should the OSD use bluestore backing
+    :returns: None
+    """
+
+    status_set('maintenance', 'Checking shared device {}'.format(dev))
+    if is_osd_disk(dev):
+        if not reformat_osd:
+            log('Disk is already an osd, skipping {}'.format(dev))
+            return
+        osd_partitions = get_osd_partitions(dev)
+        for partition in osd_partitions:
+            if filesystem_mounted(dev+partition.number):
+                log('Skipping osd, partition in use:'
+                    '{}'.format(dev+partition.number))
+                return
+        for partition in osd_partitions:
+            log('Clearing partition: {}'.format(partition))
+            # Size in M to zero, cap at 200M for speed
+            count = min(int(int(partition.sectors) / 2048), 200)
+            cmds = ['wipefs -a {}'.format(dev+partition.number),
+                    'dd if=/dev/zero of={} bs=1M'
+                    ' count={}'.format(dev+partition.number,
+                                       count),
+                    'sgdisk -d {} {}'.format(partition.number, dev),
+                    'partprobe {}'.format(dev)
+                    ]
+            for cmd in cmds:
+                try:
+                    subprocess.check_call(cmd, shell=True)
+                except subprocess.CalledProcessError:
+                    if ignore_errors:
+                        log('Unable to initialize device: {}'.format(dev),
+                            WARNING)
+                        return
+                    else:
+                        log('Unable to initialize device: {}'.format(dev),
+                            ERROR)
+                        raise
+
+    status_set('maintenance', 'Seting up shared device {}'.format(dev))
+    log('Creating ceph partitions on: {}'.format(dev), DEBUG)
+    disk_cmd = build_disk_cmd(osd_format=osd_format, reformat_osd=False,
+                              encrypt=encrypt, bluestore=bluestore)
+    log('ceph-disk cmd: {}'.format(disk_cmd), DEBUG)
+
+    cmd = [hookenv.charm_dir() + '/files/ceph/setup_osd.py']
+    argv = disk_cmd[1:]
+    argv.append(dev)
+    cmd.extend(argv)
+    try:
         subprocess.check_call(cmd)
     except subprocess.CalledProcessError:
         if ignore_errors:
@@ -2169,6 +2287,7 @@ def dirs_need_ownership_update(service):
 
     # All child directories had the expected ownership
     return False
+
 
 # A dict of valid ceph upgrade paths. Mapping is old -> new
 UPGRADE_PATHS = collections.OrderedDict([
